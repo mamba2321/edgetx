@@ -16,7 +16,12 @@ endif()
 
 if(EMSCRIPTEN)
   add_compile_options(-sUSE_SDL=2 -pthread -g)
-  add_link_options(-sUSE_SDL=2 -pthread -sPTHREAD_POOL_SIZE=4 -g)
+  add_link_options(
+    -sUSE_SDL=2 -pthread -g
+    -sPTHREAD_POOL_SIZE=4
+    -sMODULARIZE -sEXPORT_NAME=createSimu
+  )
+  set(CMAKE_EXECUTABLE_SUFFIX ".mjs")
 endif()
 
 set(SIMU_DRIVERS

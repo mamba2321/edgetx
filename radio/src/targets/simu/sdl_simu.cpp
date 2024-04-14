@@ -20,10 +20,16 @@
  */
 
 #include <SDL.h>
+#include <SDL_keycode.h>
 
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_sdlrenderer2.h>
+
+#include "gui_common.h"
+#include "hal/adc_driver.h"
+#include "hal/rotary_encoder.h"
+#include "edgetx_constants.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -59,7 +65,7 @@
 
 #include "audio.h"
 #include "debug.h"
-#include "opentx.h"
+#include "edgetx.h"
 
 #include <algorithm>
 
@@ -78,6 +84,12 @@ static const unsigned char _icon_png[] = {
 };
 #endif
 
+#if defined(ROTARY_ENCODER_NAVIGATION)
+extern volatile rotenc_t rotencValue;
+#endif
+
+int pots[MAX_POTS] = {0};
+    
 static void _set_pixel(uint8_t* pixel, const SDL_Color& color)
 {
   pixel[0] = color.a;
@@ -233,17 +245,27 @@ static bool handleKeyEvents(SDL_Event& event)
       break;
 
     case SDLK_UP:
+#if defined(ROTARY_ENCODER_NAVIGATION)
+      rotencValue -= ROTARY_ENCODER_GRANULARITY;
+      key_handled = true;
+#else
       if (keysGetSupported() & (1 << KEY_UP)) {
         key = KEY_UP;
         key_handled = true;
       }
+#endif
       break;
       
     case SDLK_DOWN:
+#if defined(ROTARY_ENCODER_NAVIGATION)
+      rotencValue += ROTARY_ENCODER_GRANULARITY;
+      key_handled = true;
+#else
       if (keysGetSupported() & (1 << KEY_DOWN)) {
         key = KEY_DOWN;
         key_handled = true;
       }
+#endif
       break;
 
     case SDLK_PLUS:
@@ -256,6 +278,20 @@ static bool handleKeyEvents(SDL_Event& event)
     case SDLK_MINUS:
       if (keysGetSupported() & (1 << KEY_MINUS)) {
         key = KEY_MINUS;
+        key_handled = true;
+      }
+      break;
+
+    case SDLK_PAGEUP:
+      if (keysGetSupported() & (1 << KEY_PAGEUP)) {
+        key = KEY_PAGEUP;
+        key_handled = true;
+      }
+      break;
+
+    case SDLK_PAGEDOWN:
+      if (keysGetSupported() & (1 << KEY_PAGEDN)) {
+        key = KEY_PAGEDN;
         key_handled = true;
       }
       break;
@@ -420,11 +456,9 @@ static void draw_pots()
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(spacing, spacing));
   ImGui::PushID("pots");
   {
-    static int pots[MAX_POTS] = {0};
-    
     ImGui::BeginGroup();
     int pot_idx = 0;
-    for (int i = 0; i < adcGetMaxInputs(ADC_INPUT_POT); i++) {
+    for (int i = 0; i < adcGetMaxInputs(ADC_INPUT_FLEX); i++) {
       if (!IS_POT_AVAILABLE(i)) {
         pots[i] = 0;
       } else {
@@ -432,16 +466,16 @@ static void draw_pots()
         ImGui::PushID(i);
         auto flags = ImGuiKnobFlags_NoTitle | ImGuiKnobFlags_ValueTooltip |
                      ImGuiKnobFlags_TitleTooltip;
-        auto label = adcGetInputLabel(ADC_INPUT_POT, i);
-        switch(POT_CONFIG(i)) {
-        case POT_WITH_DETENT:
-        case POT_WITHOUT_DETENT:
-        case POT_SLIDER_WITH_DETENT:
-          ImGuiKnobs::KnobInt(label, &pots[i], 0, 2048, 10, "%d",
+        auto label = adcGetInputLabel(ADC_INPUT_FLEX, i);
+        switch(getPotType(i)) {
+        case FLEX_POT:
+        case FLEX_POT_CENTER:
+        case FLEX_SLIDER:
+          ImGuiKnobs::KnobInt(label, &pots[i], -100, 100, 1, "%d",
                               ImGuiKnobVariant_Tick, 0, flags);
           break;
 
-        case POT_MULTIPOS_SWITCH:
+        case FLEX_MULTIPOS:
           ImGuiKnobs::KnobInt(label, &pots[i], 0, 5, 0.2f, "%d",
                               ImGuiKnobVariant_Stepped, 0, flags, 6);
           break;
@@ -483,7 +517,7 @@ static void draw_screen()
   float aspect_ratio = float(LCD_H) / float(LCD_W);
   ImVec2 size(width, width * aspect_ratio);
 
-  SimuScreen(desc, screen_frame_buffer, size, get_bg_color(),
+  SimuScreen(desc, (ImTextureID)screen_frame_buffer, size, get_bg_color(),
              (LCD_DEPTH == 16 && !isBacklightEnabled()) ?
              IM_COL32(0,0,0,127) : IM_COL32_BLACK_TRANS);
 
@@ -541,9 +575,6 @@ static void redraw()
     ImGui::Spacing();
     ImGui::Spacing();
     draw_screen();
-    // ImGui::Text("tmr10ms: %u", g_tmr10ms);
-    // ImGui::Text("rtos time: %u", RTOS_GET_MS());
-    // ImGui::Text("Backlight: %s", isBacklightEnabled() ? "on" : "off");
   }
   ImGui::End();
 
@@ -563,7 +594,7 @@ static void redraw()
 
   SDL_RenderClear(renderer);
 
-  ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+  ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
   SDL_RenderPresent(renderer);
 }
 
@@ -585,7 +616,7 @@ int main(int argc, char** argv)
 #ifdef SDL_HINT_IME_SHOW_UI
   SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
 #endif
- 
+
   // Create window with SDL_Renderer graphics context
   SDL_WindowFlags window_flags =
       (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
@@ -709,11 +740,19 @@ uint16_t simu_get_analog(uint8_t idx)
     }
   }
 
-  // idx -= max_sticks;
+  idx -= max_sticks;
 
-  // auto max_pots = adcGetMaxInputs(ADC_INPUT_POT);
-  // if (idx < max_pots)
-  //   return opentxSim->knobs[idx]->getValue();
+  auto max_pots = adcGetMaxInputs(ADC_INPUT_FLEX);
+  if (idx < max_pots) {
+    switch(getPotType(idx)){
+    case FLEX_POT:
+    case FLEX_POT_CENTER:
+    case FLEX_SLIDER:
+      return uint16_t(((uint32_t(pots[idx]) + 100) * 4096) / 200);
+    case FLEX_MULTIPOS:
+      return (uint32_t(pots[idx]) * 4096) / 5;
+    }
+  }
 
   // idx -= max_pots;
 
